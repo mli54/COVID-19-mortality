@@ -1,0 +1,189 @@
+import os
+import pandas as pd
+from sklearn.model_selection import cross_val_predict
+from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, 
+    precision_recall_curve, auc
+)
+import joblib
+
+# Feature and Target Definitions
+feature_columns = [
+    'sex', 'age_group', 'hosp_yn', 'icu_yn', 'pna_yn', 'abxchest_yn', 'acuterespdistress_yn',
+    'mechvent_yn', 'fever_yn', 'sfever_yn', 'chills_yn', 'myalgia_yn', 'runnose_yn',
+    'sthroat_yn', 'cough_yn', 'sob_yn', 'nauseavomit_yn', 'headache_yn', 'abdom_yn',
+    'diarrhea_yn', 'medcond_yn'
+]
+target_column = 'death_yn'
+
+# Load and Preprocess Data
+def load_and_preprocess_data(df, races, ethnicity):
+    if ethnicity == 'Hispanic/Latino':
+        df_filtered = df[df['ethnicity'] == ethnicity]
+    else:
+        df_filtered = df[df['race'].isin(races) & (df['ethnicity'] == ethnicity)]
+    
+    df_filtered = df_filtered[df_filtered['current_status'] == 'Laboratory-confirmed case']
+    df_filtered = df_filtered[df_filtered['death_yn'].isin(['Yes', 'No'])]
+    invalid_values = ['Missing', 'N/A', 'NA', 'Unknown']
+    df_filtered = df_filtered[~df_filtered[feature_columns + [target_column]].isin(invalid_values).any(axis=1)]
+    df_filtered = df_filtered.dropna(subset=feature_columns + [target_column])
+    df_filtered[target_column] = df_filtered[target_column].map({'Yes': 1, 'No': 0})
+
+    encoder = LabelEncoder()
+    for col in feature_columns:
+        df_filtered.loc[:, col] = encoder.fit_transform(df_filtered[col].astype(str))
+    
+    print(f"Number of cases after filtration for {ethnicity} ethnicity: {len(df_filtered)}")
+    return df_filtered
+
+# Define Models
+def define_models():
+    models = {
+        "Decision Tree": DecisionTreeClassifier(),
+        "Random Forest": RandomForestClassifier(),
+        "Gradient Boosting": GradientBoostingClassifier(),
+        "Logistic Regression": LogisticRegression(max_iter=1000)
+    }
+    return models
+
+# Cross-Validate Model Performance
+def cross_validate_model_with_aucpr(model, X, y, cv=10):
+    """
+    Perform 10-fold cross-validation and return average performance metrics, including AUCPR.
+    """
+    y_pred = cross_val_predict(model, X, y, cv=cv, method='predict')
+    y_proba = cross_val_predict(model, X, y, cv=cv, method='predict_proba')[:, 1]
+    precision, recall, _ = precision_recall_curve(y, y_proba)
+    aucpr = auc(recall, precision)
+    results = {
+        "Accuracy": accuracy_score(y, y_pred),
+        "Precision": precision_score(y, y_pred),
+        "Recall": recall_score(y, y_pred),
+        "F1 Score": f1_score(y, y_pred),
+        "ROC-AUC Score": roc_auc_score(y, y_proba),
+        "AUCPR": aucpr
+    }
+    return results
+
+# Evaluate Equalized Odds
+def calculate_equalized_odds(y_true, y_pred, sensitive_attribute):
+    """
+    Compute Equalized Odds (TPR and FPR) for each demographic group.
+    """
+    groups = set(sensitive_attribute)
+    equalized_odds = {}
+
+    for group in groups:
+        group_indices = (sensitive_attribute == group)
+        y_true_group = y_true[group_indices]
+        y_pred_group = y_pred[group_indices]
+
+        # Calculate True Positive Rate (TPR)
+        tp = ((y_true_group == 1) & (y_pred_group == 1)).sum()
+        fn = ((y_true_group == 1) & (y_pred_group == 0)).sum()
+        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+        # Calculate False Positive Rate (FPR)
+        fp = ((y_true_group == 0) & (y_pred_group == 1)).sum()
+        tn = ((y_true_group == 0) & (y_pred_group == 0)).sum()
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+
+        equalized_odds[group] = {"TPR": tpr, "FPR": fpr}
+    
+    return equalized_odds
+
+# Train Base Models on Non-Hispanic White Data
+def train_base_model_on_white(df):
+    df_filtered = load_and_preprocess_data(df, ['White'], 'Non-Hispanic/Latino')
+    X = df_filtered[feature_columns]
+    y = df_filtered[target_column]
+
+    models = define_models()
+    white_base_performance = {}
+
+    for name, model in models.items():
+        print(f"Training base model: {name} for Non-Hispanic White population with 10-fold cross-validation")
+        white_base_performance[name] = cross_validate_model_with_aucpr(model, X, y, cv=10)
+        joblib.dump(model, f"{name}_base_model.pkl")
+        print(f"Cross-Validation Results - {name} for Non-Hispanic White population: {white_base_performance[name]}")
+
+    return white_base_performance
+
+# Fine-Tune Models for Minority Groups Using Transfer Learning
+def fine_tune_models_on_minority(df, races, ethnicity):
+    df_filtered = load_and_preprocess_data(df, races, ethnicity)
+    X = df_filtered[feature_columns]
+    y = df_filtered[target_column]
+
+    models = ["Decision Tree", "Random Forest", "Gradient Boosting", "Logistic Regression"]
+    fine_tuned_performance = {}
+
+    for name in models:
+        base_model = joblib.load(f"{name}_base_model.pkl")
+        print(f"Fine-tuning {name} model for {ethnicity} population with 10-fold cross-validation")
+        
+        tuned_model = base_model
+        if hasattr(tuned_model, 'set_params'):
+            if name == "Random Forest":
+                tuned_model.set_params(n_estimators=100, max_depth=10, min_samples_split=5)
+            elif name == "Gradient Boosting":
+                tuned_model.set_params(learning_rate=0.01, n_estimators=200, max_depth=6)
+            elif name == "Decision Tree":
+                tuned_model.set_params(max_depth=10, min_samples_split=5)
+        
+        tuned_model.fit(X, y)
+        joblib.dump(tuned_model, f"{name}_fine_tuned_model.pkl")
+        fine_tuned_performance[name] = cross_validate_model_with_aucpr(tuned_model, X, y, cv=10)
+        print(f"Fine-Tuned Model - {name} Results for {ethnicity} population: {fine_tuned_performance[name]}")
+
+    return fine_tuned_performance
+
+# Compare Models
+def compare_models_with_equalized_odds(df, races, ethnicity):
+    print(f"\n--- Evaluating Base Models for {ethnicity} Population ---")
+    base_performance = fine_tune_models_on_minority(df, races, ethnicity)
+
+    df_filtered = load_and_preprocess_data(df, races, ethnicity)
+    X = df_filtered[feature_columns]
+    y = df_filtered[target_column]
+    sensitive_attribute = df_filtered["race"] if ethnicity != "Hispanic/Latino" else df_filtered["ethnicity"]
+
+    equalized_odds_results = {}
+    for name in ["Decision Tree", "Random Forest", "Gradient Boosting", "Logistic Regression"]:
+        model = joblib.load(f"{name}_base_model.pkl")
+        base_equalized_odds = calculate_equalized_odds(y, cross_val_predict(model, X, y, cv=10, method='predict'), sensitive_attribute)
+
+        fine_tuned_model = joblib.load(f"{name}_fine_tuned_model.pkl")
+        fine_tuned_equalized_odds = calculate_equalized_odds(y, cross_val_predict(fine_tuned_model, X, y, cv=10, method='predict'), sensitive_attribute)
+
+        equalized_odds_results[name] = {
+            "Base Model": base_equalized_odds,
+            "Fine-Tuned Model": fine_tuned_equalized_odds
+        }
+    return base_performance, equalized_odds_results
+
+# Load Data
+directory_path = r'C:\Users\tgu1\Documents\Covid-19 Restricted Access Data'
+csv_files = [os.path.join(directory_path, f) for f in os.listdir(directory_path) if f.endswith('.csv')]
+df = pd.concat((pd.read_csv(file) for file in csv_files), ignore_index=True)
+
+# Train and Evaluate Models
+print("\nTraining Base Models on Non-Hispanic White Population")
+white_base = train_base_model_on_white(df)
+
+print("\nComparing Models for Non-Hispanic Black Population")
+black_base, black_equalized_odds = compare_models_with_equalized_odds(df, ['Black'], 'Non-Hispanic/Latino')
+
+print("\nComparing Models for Hispanic Population")
+hispanic_base, hispanic_equalized_odds = compare_models_with_equalized_odds(df, [], 'Hispanic/Latino')
+
+print("\nComparing Models for Non-Hispanic American Indian Population")
+native_base, native_equalized_odds = compare_models_with_equalized_odds(df, ['American Indian/Alaska Native'], 'Non-Hispanic/Latino')
+
+print("\nComparing Models for Asian/Pacific Islander Population")
+asian_base, asian_equalized_odds = compare_models_with_equalized_odds(df, ['Asian', 'Native Hawaiian/Other Pacific Islander'], 'Non-Hispanic/Latino')
